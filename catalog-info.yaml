@@ -1,0 +1,29 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: enveronyx-ci-pack-shim
+  description: |
+    Public, caller-facing reusable GitHub Actions workflows for the EnverOnyx CI pack.
+    Callable from any GitHub organization. Holds no proprietary logic and no secret
+    value — it authenticates with the caller's registry credential, verifies the
+    licence entitlement, installs the pinned licensed artifact, and delegates to it.
+  annotations:
+    github.com/project-slug: 'enveronyx/enveronyx-ci-pack-shim'
+  tags:
+    - github-actions
+    - ci-cd
+    - pipelines
+    - public
+  links:
+    - url: https://github.com/enveronyx/enveronyx-ci-pack-shim
+      title: 'GitHub Repository'
+      icon: code
+      type: repository
+spec:
+  type: service
+  lifecycle: production
+  owner: platform-engineering
+  system: enveronyx-platform
+  domain: delivery
+  dependsOn:
+    - component:enveronyx-ci-pack

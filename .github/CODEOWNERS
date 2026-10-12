@@ -1,0 +1,10 @@
+# Default — platform engineering team owns everything
+* @enveronyx/platform-engineering
+
+# This repository is PUBLIC and is the org's caller-facing supply-chain surface.
+# Every change here is visible to every client. Guard closely.
+/.github/workflows/         @enveronyx/platform-engineering
+
+# Repo standard artifacts — keep aligned with catalog-info.yaml spec.owner
+/catalog-info.yaml          @enveronyx/platform-engineering
+/AGENTS.md                  @enveronyx/platform-engineering

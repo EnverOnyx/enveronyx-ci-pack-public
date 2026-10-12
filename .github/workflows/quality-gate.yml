@@ -1,0 +1,267 @@
+# Ci_Pack_Shim — Quality Gate
+#
+# Public caller surface (R17.1). Holds no proprietary logic and no secret value (R17.2): it
+# authenticates to the registry with the caller-supplied Artifact_Registry_Credential, verifies the
+# Licence_Entitlement, installs the pinned Licensed_Artifact, and delegates to `ci-pack-logic quality-gate`.
+#
+# Caller contract is the Ci_Pack's own, so an existing reference keeps resolving (R17.5).
+#
+# Consumer usage:
+#   uses: EnverOnyx/enveronyx-ci-pack-shim/.github/workflows/quality-gate.yml@v1
+#   with:
+#     logic-version: '1'
+#   secrets:
+#     ARTIFACT_REGISTRY_TOKEN: ${{ secrets.ENVERONYX_REGISTRY_TOKEN }}
+
+name: Quality Gate (shim)
+
+on:
+  workflow_call:
+    inputs:
+      logic-version:
+        description: Licensed_Artifact major version to install and delegate to (R17.3). Pinned by the caller.
+        type: string
+        required: true
+      logic-registry-url:
+        description: Registry the Licensed_Artifact is retrieved from
+        type: string
+        required: false
+        default: https://npm.pkg.github.com
+      eslint-enabled:
+        description: Enable ESLint check
+        type: boolean
+        default: true
+      dependency-scan-enabled:
+        description: Enable dependency scan (npm audit)
+        type: boolean
+        default: true
+      iac-security-enabled:
+        description: Enable IaC security scan (Checkov)
+        type: boolean
+        default: true
+      coverage-enabled:
+        description: DEPRECATED — use ts-test.yml coverage input instead
+        type: boolean
+        default: false
+      sbom-enabled:
+        description: Enable SBOM generation (CycloneDX)
+        type: boolean
+        default: true
+      conventional-commits-enabled:
+        description: Enable conventional commits validation
+        type: boolean
+        default: false
+      semgrep-enabled:
+        description: Enable Semgrep SAST scan
+        type: boolean
+        default: true
+      cdk-nag-enabled:
+        description: Enable cdk-nag security check (requires CDK project)
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: Minimum code coverage percentage
+        type: number
+        default: 80
+      scan-exclusions:
+        description: Comma-separated glob patterns to exclude from scans
+        type: string
+        default: ''
+      test-command:
+        description: Custom test command for coverage
+        type: string
+        default: ''
+      checkov-soft-fail:
+        description: Treat Checkov findings as warnings instead of failures
+        type: boolean
+        default: false
+    secrets:
+      ARTIFACT_REGISTRY_TOKEN:
+        description: >-
+          Caller-supplied Artifact_Registry_Credential used to retrieve the Licensed_Artifact (R17.5). Never held by
+          the shim.
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  delegate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.3.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: '22'
+
+      - name: Authenticate to the Licensed_Artifact registry
+        env:
+          REGISTRY_URL: ${{ inputs['logic-registry-url'] }}
+          ARTIFACT_REGISTRY_TOKEN: ${{ secrets.ARTIFACT_REGISTRY_TOKEN }}
+        run: |
+          # Written to a run-scoped file, never committed. The shim holds no credential of its
+          # own — the value is the caller's Artifact_Registry_Credential (R17.2, R17.5).
+          REGISTRY_HOST="${REGISTRY_URL#https://}"
+          REGISTRY_HOST="${REGISTRY_HOST#http://}"
+          {
+            echo "@enveronyx:registry=${REGISTRY_URL}"
+            echo "//${REGISTRY_HOST}/:_authToken=${ARTIFACT_REGISTRY_TOKEN}"
+          } > "${RUNNER_TEMP}/.npmrc"
+          echo "NPM_CONFIG_USERCONFIG=${RUNNER_TEMP}/.npmrc" >> "$GITHUB_ENV"
+
+      - name: Verify Licence_Entitlement
+        env:
+          LOGIC_VERSION: ${{ inputs['logic-version'] }}
+          LOGIC_REGISTRY_URL: ${{ inputs['logic-registry-url'] }}
+          ARTIFACT_REGISTRY_TOKEN: ${{ secrets.ARTIFACT_REGISTRY_TOKEN }}
+        run: |
+          # Canonical Ci_Pack_Shim Licence_Entitlement gate.
+          #
+          # This is the single source of truth for the shim's `Verify Licence_Entitlement` step. It is embedded
+          # verbatim into all 15 shim workflows; `scripts/check-shim-gate-drift.mjs` fails the pack's own CI if a
+          # shim copy diverges from this file.
+          #
+          # Why it is shell rather than the TypeScript gate: this runs **before** the Licensed_Artifact is
+          # installed (R17.6), so no part of `@enveronyx/ci-pack-logic` is available to call yet. The decision
+          # mirrors `packages/ci-pack-logic/src/licence/check-entitlement.ts` — same order, same reasons, same
+          # remediation text — and the artifact re-runs the typed gate at execution as defence in depth.
+          #
+          # Nothing here is proprietary: it names an entitlement and tells the caller how to obtain one. Publishing
+          # it discloses nothing (R17.2).
+          #
+          # Inputs, from the environment:
+          #   LOGIC_VERSION            the caller's `logic-version` input, verbatim
+          #   ARTIFACT_REGISTRY_TOKEN  the caller's Artifact_Registry_Credential
+          #   LOGIC_REGISTRY_URL       registry the artifact is retrieved from
+          #
+          # Exit 0 means the install step may proceed. Exit 1 means it must not.
+          #
+          # _Requirements: 17.5, 17.6_
+
+          set -uo pipefail
+
+          ENTITLEMENT='@enveronyx/ci-pack-logic'
+          CONTACT='platform@enveronyx.com'
+
+          # Renders a refusal in the shape R17.6 requires: the entitlement named, the cause, the remediation.
+          refuse() {
+            local cause="$1" remediation="$2"
+            echo "::error::Licence_Entitlement for ${ENTITLEMENT} is not usable: ${cause}. ${remediation}"
+            echo "❌ Licence_Entitlement check failed."
+            echo "   Entitlement: ${ENTITLEMENT}"
+            echo "   Cause:       ${cause}"
+            echo "   Remediation: ${remediation}"
+            exit 1
+          }
+
+          # 1. Credential. Checked first so a missing secret names the secret (R17.5) rather than surfacing later
+          #    as a registry authentication error.
+          if [ -z "${ARTIFACT_REGISTRY_TOKEN:-}" ]; then
+            refuse "no Artifact_Registry_Credential was supplied" \
+              "Supply the ARTIFACT_REGISTRY_TOKEN secret to the workflow — it is your client-scoped Artifact_Registry_Credential. Contact ${CONTACT} if you have not been issued one."
+          fi
+
+          # 2. The pin. Refused before the registry is consulted, so a floating version can never reach resolution
+          #    and become a 'latest' install.
+          case "${LOGIC_VERSION:-}" in
+            '' | latest | next | canary | '*' | x | X)
+              refuse "no explicit major version was pinned (received '${LOGIC_VERSION:-}')" \
+                "Set the logic-version input to an explicit major version, for example '1'. A floating or empty version is refused so a client is never silently moved off its pinned platform version."
+              ;;
+          esac
+
+          LOGIC_MAJOR="${LOGIC_VERSION#[vV]}"
+          LOGIC_MAJOR="${LOGIC_MAJOR%%.*}"
+          case "$LOGIC_MAJOR" in
+            '' | *[!0-9]*)
+              refuse "no explicit major version was pinned (received '${LOGIC_VERSION}')" \
+                "Set the logic-version input to an explicit major version, for example '1'. A floating or empty version is refused so a client is never silently moved off its pinned platform version."
+              ;;
+          esac
+
+          # 3. The registry's answer. Entitlement is registry-enforced: a caller without a Licence_Entitlement for
+          #    this major cannot read its metadata. Distinguish "no entitlement" from "registry did not answer" —
+          #    the second is an unproven licence, not a valid one, and never opens the gate.
+          VERSIONS_JSON=''
+          VIEW_STDERR="$(mktemp)"
+          if VERSIONS_JSON="$(npm view "${ENTITLEMENT}" versions --json 2>"$VIEW_STDERR")"; then
+            :
+          else
+            STDERR_TEXT="$(cat "$VIEW_STDERR")"
+            rm -f "$VIEW_STDERR"
+            case "$STDERR_TEXT" in
+              *E401* | *E403* | *Unauthorized* | *Forbidden*)
+                refuse "no entitlement is on record for the supplied credential" \
+                  "No licence entitlement is on record for this credential. Contact ${CONTACT} to obtain an entitlement before invoking this workflow."
+                ;;
+              *E404* | *'is not in this registry'* | *'404 Not Found'*)
+                refuse "no entitlement is on record for the supplied credential" \
+                  "No licence entitlement is on record for this credential. Contact ${CONTACT} to obtain an entitlement before invoking this workflow."
+                ;;
+              *)
+                refuse "the entitlement could not be verified (${LOGIC_REGISTRY_URL:-registry} did not answer)" \
+                  "The registry could not be reached, so your entitlement could not be verified. This is treated as unverified rather than valid. Retry the workflow; contact ${CONTACT} if it persists."
+                ;;
+            esac
+          fi
+          rm -f "$VIEW_STDERR"
+
+          # 4. Publication of the pinned major. The entitlement permits reading, but the registry may publish
+          #    nothing for this major. Fail naming the requested version and what is available — never resolve to
+          #    anything else, because silently upgrading past a pinned Platform_Version is what R22 prevents.
+          PUBLISHED_MAJORS="$(
+            printf '%s' "$VERSIONS_JSON" \
+              | tr -d '[]" ' \
+              | tr ',' '\n' \
+              | sed -n 's/^\([0-9][0-9]*\)\..*$/\1/p;s/^\([0-9][0-9]*\)$/\1/p' \
+              | sort -nu \
+              | tr '\n' ' '
+          )"
+          PUBLISHED_MAJORS="${PUBLISHED_MAJORS% }"
+
+          if [ -z "$PUBLISHED_MAJORS" ]; then
+            refuse "the requested major version is not published (requested major ${LOGIC_MAJOR}, no versions are published)" \
+              "Your entitlement covers this major version but the registry publishes no release of it. Pin a published logic-version, or contact ${CONTACT}. This workflow will not fall back to a newer version, because that would move you off your pinned platform version."
+          fi
+
+          case " ${PUBLISHED_MAJORS} " in
+            *" ${LOGIC_MAJOR} "*) ;;
+            *)
+              refuse "the entitlement does not cover the requested major version (requested major ${LOGIC_MAJOR}, available to this entitlement: ${PUBLISHED_MAJORS})" \
+                "Your entitlement does not cover the major version this workflow pinned. Either pin a logic-version your entitlement covers, or contact ${CONTACT} to extend the entitlement to cover it."
+              ;;
+          esac
+
+          echo "✅ Licence_Entitlement verified for ${ENTITLEMENT} major ${LOGIC_MAJOR}."
+          echo "   Resolved to ${ENTITLEMENT}@^${LOGIC_MAJOR} — the pinned major, never 'latest'."
+
+      - name: Install the pinned Licensed_Artifact
+        env:
+          LOGIC_VERSION: ${{ inputs['logic-version'] }}
+        run: npm install --no-save --no-audit --no-fund "@enveronyx/ci-pack-logic@^${LOGIC_VERSION}"
+
+      - name: Delegate to ci-pack-logic quality-gate
+        id: delegate
+        run: npx --no-install ci-pack-logic quality-gate
+        env:
+          CI_PACK_LOGIC_GATE_ALREADY_VERIFIED: 'true'
+          CI_PACK_INPUT_ESLINT_ENABLED: ${{ inputs['eslint-enabled'] }}
+          CI_PACK_INPUT_DEPENDENCY_SCAN_ENABLED: ${{ inputs['dependency-scan-enabled'] }}
+          CI_PACK_INPUT_IAC_SECURITY_ENABLED: ${{ inputs['iac-security-enabled'] }}
+          CI_PACK_INPUT_COVERAGE_ENABLED: ${{ inputs['coverage-enabled'] }}
+          CI_PACK_INPUT_SBOM_ENABLED: ${{ inputs['sbom-enabled'] }}
+          CI_PACK_INPUT_CONVENTIONAL_COMMITS_ENABLED: ${{ inputs['conventional-commits-enabled'] }}
+          CI_PACK_INPUT_SEMGREP_ENABLED: ${{ inputs['semgrep-enabled'] }}
+          CI_PACK_INPUT_CDK_NAG_ENABLED: ${{ inputs['cdk-nag-enabled'] }}
+          CI_PACK_INPUT_COVERAGE_THRESHOLD: ${{ inputs['coverage-threshold'] }}
+          CI_PACK_INPUT_SCAN_EXCLUSIONS: ${{ inputs['scan-exclusions'] }}
+          CI_PACK_INPUT_TEST_COMMAND: ${{ inputs['test-command'] }}
+          CI_PACK_INPUT_CHECKOV_SOFT_FAIL: ${{ inputs['checkov-soft-fail'] }}
